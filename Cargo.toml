@@ -1,0 +1,31 @@
+[package]
+name = "kp-stepwise"
+version = "0.3.0"
+edition = "2021"
+description = "Stepwise planning MCP server with branching, exploration, and spawn hints"
+license = "MIT"
+
+[[bin]]
+name = "kp-stepwise"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+strip = true

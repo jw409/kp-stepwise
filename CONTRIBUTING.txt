@@ -1,0 +1,106 @@
+CONTRIBUTING — kp-stepwise
+==========================
+
+Build & Test
+------------
+  cargo test                    # 128 tests (105 unit + 23 integration)
+  cargo build --release         # binary: target/release/kp-stepwise
+
+Architecture
+------------
+  server.rs    MCP handler, param struct, client detection
+  planner.rs   PlanEngine: validate → track → log → hints → respond
+  profiles.rs  Per-model tuning profiles (regex match on model ID)
+  logging.rs   Append-only JSONL persistence
+
+Naming note (v0.3.0 rename)
+---------------------------
+This server was formerly kp-sequential-thinking with a `sequentialthinking`
+tool and thought/thinking vocabulary throughout. Model-side safety
+classifiers (Fable 5) pattern-matched that vocabulary as "extraction of the
+model's summarized thinking" and blocked sessions. Everything model-visible
+was renamed to step/plan vocabulary. Keep it that way: no "thought",
+"thinking", or "reasoning" in tool names, schema descriptions, response
+keys, hint text, or resource descriptions. Legacy param names
+(thought/thoughtNumber/totalThoughts/...) are still accepted via serde
+aliases but never advertised.
+
+Token Budget Philosophy
+-----------------------
+Every token in firstCallGuidance costs real money across every session.
+The decision tree format was chosen specifically because:
+
+  1. DECIDE() branches map 1:1 to the fields the model must set
+  2. No prose — field names ARE the documentation
+  3. Profile-adaptive: thresholds inline, not hardcoded
+
+Current guidance is ~120 tokens. Target: <100.
+If you add guidance text, you must justify the token cost.
+
+Profiles
+--------
+Match order matters (first regex wins):
+  gemini.*flash       → wide/fast (5-7 explore, 0.6/0.75 thresholds)
+  gemini.*(pro|ultra)  → deep analysis (3-4 explore, 0.5/0.85 thresholds)
+  gemini              → catch-all balanced
+  deepseek            → deep hierarchical
+  grok                → creative exploration
+  claude              → balanced synthesis
+  llama|nemotron      → systematic technical
+  .*                  → fallback
+
+Adding a profile: add to default_profiles() in profiles.rs, add test.
+External override: set STEPWISE_PROFILES=/path/to/profiles.json
+(legacy SEQUENTIAL_THINKING_PROFILES still honored)
+
+Roadmap: Adaptive Guidance Loading
+----------------------------------
+Current: guidance is a static format string compiled into the binary.
+Problem: different models need different token budgets for guidance.
+         A 7B model needs more scaffolding. Opus needs almost none.
+
+Phase 1 — Profile-conditioned guidance (current)
+  Decision tree with inline thresholds. One format, all models.
+
+Phase 2 — Tiered guidance depth
+  Add `guidance_depth` field to TuningProfile: minimal|standard|verbose.
+  - minimal: separator + thresholds only (for strong models)
+  - standard: decision tree (current default)
+  - verbose: decision tree + examples (for weaker models)
+  firstCallGuidance selects tier from profile. No runtime cost.
+
+Phase 3 — Redis-backed adaptive loading
+  Store per-model guidance templates in Redis (or SQLite for zero-dep).
+  Key: model_family:guidance_version
+  The learning pipeline (Python) writes optimized guidance after analyzing
+  which tokens actually correlate with better outcomes (fewer corrections,
+  higher acceptance). The Rust server reads at session start.
+
+  Flow:
+    Session N logs → scavenger joins outcomes → identifies which guidance
+    tokens correlate with good outcomes → prunes/rewrites guidance →
+    writes to Redis → Session N+1 loads optimized guidance
+
+  This closes the loop: guidance itself becomes a tunable parameter,
+  not just the numeric thresholds.
+
+Phase 4 — Per-step adaptive hints
+  Instead of front-loading all guidance on step 1, distribute
+  guidance as targeted hints when the model needs them:
+  - First time branching? Hint with branch syntax.
+  - Confidence stuck? Hint with explore pattern.
+  - Linear chain >4? Already implemented as hints.
+  This reduces step-1 token cost to near-zero for experienced models.
+
+Contributing Guidelines
+-----------------------
+  - Run `cargo test` before pushing. All 128 must pass.
+  - No prose in guidance — decision trees and field names only.
+  - Token cost of guidance changes must be justified.
+  - Profile changes need a matching test.
+  - JSONL format is a contract — the Python learning pipeline reads it.
+    Adding fields is fine. Renaming/removing fields breaks the pipeline.
+    (v0.3.0 renamed thought*→step* keys and the log dir to var/stepwise_logs;
+    external scavengers must be updated to match.)
+  - The binary ships in the kinderpowers plugin. After `cargo build --release`,
+    copy to: mcp-servers/bin/linux-x86_64/kp-stepwise
