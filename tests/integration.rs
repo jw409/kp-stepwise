@@ -61,19 +61,33 @@ impl McpClient {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Value {
+        self.send_call(method, params).await;
+        self.read_response().await
+    }
+
+    async fn send_call(&mut self, method: &str, params: Value) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         self.stdin.write_all(line.as_bytes()).await.unwrap();
         self.stdin.flush().await.unwrap();
+        id
+    }
 
+    async fn read_response(&mut self) -> Value {
         let mut buf = String::new();
         self.reader.read_line(&mut buf).await.unwrap();
         serde_json::from_str(&buf).unwrap()
     }
 
-    async fn tool_call(&mut self, name: &str, args: Value) -> Value {
+    async fn tool_call(&mut self, name: &str, mut args: Value) -> Value {
+        if name == "stepwise_plan" {
+            args.as_object_mut()
+                .expect("tool arguments should be an object")
+                .entry("channelId")
+                .or_insert_with(|| json!("test-main"));
+        }
         self.call("tools/call", json!({"name": name, "arguments": args}))
             .await
     }
@@ -121,6 +135,11 @@ async fn test_tools_list() {
     assert_eq!(tool["name"].as_str().unwrap(), "stepwise_plan");
     // Should have inputSchema
     assert!(tool["inputSchema"].is_object(), "Should have inputSchema");
+    assert!(tool["inputSchema"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "channelId"));
 }
 
 #[tokio::test]
@@ -158,9 +177,15 @@ async fn test_basic_step() {
         .tool_call(
             "stepwise_plan",
             json!({
-                "step": "Analyzing the problem structure",
+                "step": "Repository evidence narrows the problem to one boundary",
+                "roomId": "integration-room",
                 "stepNumber": 1,
-                "totalSteps": 3
+                "totalSteps": 3,
+                "turnId": "turn-1",
+                "checkpointKind": "observation",
+                "evidence": ["src/server.rs:159"],
+                "openQuestions": ["Does the client pipeline calls?"],
+                "nextAction": "Probe ordering"
             }),
         )
         .await;
@@ -172,6 +197,165 @@ async fn test_basic_step() {
     assert_eq!(parsed["totalSteps"], 3);
     assert_eq!(parsed["nextStepNeeded"], true);
     assert_eq!(parsed["stepCount"], 1);
+    assert_eq!(parsed["expectedNextStep"], 2);
+    assert_eq!(parsed["turnId"], "turn-1");
+    assert_eq!(parsed["checkpointKind"], "observation");
+    assert!(parsed["sessionId"].is_string());
+    assert_eq!(parsed["roomId"], "integration-room");
+    assert_eq!(parsed["channelId"], "test-main");
+    assert!(parsed["logMode"].is_string());
+}
+
+#[tokio::test]
+async fn test_out_of_order_step_rejected_then_recoverable() {
+    let mut client = McpClient::new().await;
+    let first = client
+        .tool_call(
+            "stepwise_plan",
+            json!({"step": "First checkpoint", "stepNumber": 1, "totalSteps": 3}),
+        )
+        .await;
+    assert!(!McpClient::is_tool_error(&first));
+
+    let early = client
+        .tool_call(
+            "stepwise_plan",
+            json!({"step": "Arrived too early", "stepNumber": 3, "totalSteps": 3}),
+        )
+        .await;
+    assert!(McpClient::is_tool_error(&early));
+    let error = McpClient::get_parsed(&early);
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("expected 2, got 3"));
+
+    let second = client
+        .tool_call(
+            "stepwise_plan",
+            json!({"step": "Second checkpoint", "stepNumber": 2, "totalSteps": 3}),
+        )
+        .await;
+    assert!(!McpClient::is_tool_error(&second));
+    let parsed = McpClient::get_parsed(&second);
+    assert_eq!(parsed["stepCount"], 2);
+    assert_eq!(parsed["expectedNextStep"], 3);
+}
+
+#[tokio::test]
+async fn test_parallel_channels_start_at_one_without_state_pollution() {
+    let mut client = McpClient::new().await;
+
+    let id_a = client
+        .send_call(
+            "tools/call",
+            json!({
+                "name": "stepwise_plan",
+                "arguments": {
+                "roomId": "eval-repair",
+                "channelId": "opus-gold-type",
+                "step": "Agent A first checkpoint",
+                "stepNumber": 1,
+                "totalSteps": 3,
+                "confidence": 0.2
+                }
+            }),
+        )
+        .await;
+    let id_b = client
+        .send_call(
+            "tools/call",
+            json!({
+                "name": "stepwise_plan",
+                "arguments": {
+                "roomId": "eval-repair",
+                "channelId": "sonnet-corpus-replay",
+                "step": "Agent B first checkpoint",
+                "stepNumber": 1,
+                "totalSteps": 2,
+                "confidence": 0.9
+                }
+            }),
+        )
+        .await;
+
+    let first = client.read_response().await;
+    let second = client.read_response().await;
+    let (agent_a, agent_b) = if first["id"] == id_a {
+        (first, second)
+    } else {
+        assert_eq!(first["id"], id_b);
+        (second, first)
+    };
+    assert_eq!(agent_a["id"], id_a);
+    assert_eq!(agent_b["id"], id_b);
+    assert!(!McpClient::is_tool_error(&agent_a));
+    assert!(!McpClient::is_tool_error(&agent_b));
+    let parsed_a = McpClient::get_parsed(&agent_a);
+    let parsed_b = McpClient::get_parsed(&agent_b);
+    assert_eq!(parsed_a["stepCount"], 1);
+    assert_eq!(parsed_b["stepCount"], 1);
+    assert_eq!(parsed_a["expectedNextStep"], 2);
+    assert_eq!(parsed_b["expectedNextStep"], 2);
+    assert_eq!(parsed_a["usageStats"]["lowConfWithoutBranchCount"], 1);
+    assert_eq!(parsed_b["usageStats"]["lowConfWithoutBranchCount"], 0);
+
+    let channels = client
+        .call(
+            "resources/read",
+            json!({"uri": "stepwise://rooms/eval-repair/channels"}),
+        )
+        .await;
+    assert!(!McpClient::is_error(&channels));
+    let text = channels["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("room channel index");
+    let index: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(index["channelCount"], 2);
+    let channel_ids: Vec<&str> = index["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|channel| channel["channelId"].as_str())
+        .collect();
+    assert_eq!(channel_ids, vec!["opus-gold-type", "sonnet-corpus-replay"]);
+}
+
+#[tokio::test]
+async fn test_session_resource_is_inspectable() {
+    let mut client = McpClient::new().await;
+    let step = client
+        .tool_call(
+            "stepwise_plan",
+            json!({
+                "roomId": "inspect-room",
+                "channelId": "inspect-agent",
+                "step": "Inspectable checkpoint",
+                "stepNumber": 1,
+                "totalSteps": 2
+            }),
+        )
+        .await;
+    assert!(!McpClient::is_tool_error(&step));
+
+    let response = client
+        .call(
+            "resources/read",
+            json!({"uri": "stepwise://rooms/inspect-room/channels/inspect-agent/session"}),
+        )
+        .await;
+    assert!(!McpClient::is_error(&response));
+    let text = response["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("session resource text");
+    let session: Value = serde_json::from_str(text).unwrap();
+    assert!(session["sessionId"].is_string());
+    assert!(session["profile"].is_string());
+    assert!(session["logMode"].is_string());
+    assert_eq!(session["roomId"], "inspect-room");
+    assert_eq!(session["channelId"], "inspect-agent");
+    assert_eq!(session["checkpointCount"], 1);
+    assert_eq!(session["expectedNextStep"], 2);
 }
 
 #[tokio::test]
@@ -530,8 +714,7 @@ async fn test_search_query_passthrough() {
         .await;
     let parsed = McpClient::get_parsed(&resp);
     assert_eq!(
-        parsed["pendingSearchQuery"],
-        "how does X work",
+        parsed["pendingSearchQuery"], "how does X work",
         "Should pass through search query"
     );
     assert!(
@@ -617,7 +800,10 @@ async fn test_confidence_clamping() {
     assert!(!McpClient::is_tool_error(&resp));
     // Should not crash - response should be valid
     let parsed = McpClient::get_parsed(&resp);
-    assert!(parsed.get("guidance").is_some(), "High confidence should produce guidance");
+    assert!(
+        parsed.get("guidance").is_some(),
+        "High confidence should produce guidance"
+    );
 }
 
 #[tokio::test]
@@ -721,14 +907,22 @@ async fn test_subagent_spawn_hint_on_parallel_branch() {
 
     let parsed = McpClient::get_parsed(&resp);
     let hints = parsed["hints"].as_array().expect("should have hints");
-    let subagent_hint = hints.iter().find(|h| h["kind"] == "subagent_spawn_available");
+    let subagent_hint = hints
+        .iter()
+        .find(|h| h["kind"] == "subagent_spawn_available");
     assert!(
         subagent_hint.is_some(),
         "Should emit subagent_spawn_available hint for parallel branch with 3+ proposals"
     );
     let msg = subagent_hint.unwrap()["message"].as_str().unwrap();
-    assert!(msg.contains("approach-a"), "Hint should reference branch name");
-    assert!(msg.contains("3 proposals"), "Hint should mention proposal count");
+    assert!(
+        msg.contains("approach-a"),
+        "Hint should reference branch name"
+    );
+    assert!(
+        msg.contains("3 proposals"),
+        "Hint should mention proposal count"
+    );
 }
 
 #[tokio::test]

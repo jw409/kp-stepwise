@@ -21,6 +21,33 @@ pub struct TuningProfile {
 /// Built-in profiles for common model families.
 pub fn default_profiles() -> Vec<TuningProfile> {
     vec![
+        // GPT-5.6 Sol already performs native reasoning. Use this MCP as a
+        // sparse external checkpoint ledger rather than a narrated scratchpad.
+        TuningProfile {
+            model_pattern: "gpt-5\\.6(-sol)?|(^|[/_-])sol($|[/_-])".into(),
+            display_name: "OpenAI Sol".into(),
+            default_explore_count: 2,
+            max_explore_count: 3,
+            default_layer_depth: 2,
+            branching_threshold: 0.4,
+            confidence_threshold: 0.85,
+            context_window: "compact".into(),
+            token_budget_multiplier: 1.0,
+            guidance: "Use sparse checkpoints at decisions, evidence changes, revisions, and handoffs; rely on native reasoning between calls.".into(),
+        },
+        // Other OpenAI reasoning and coding models.
+        TuningProfile {
+            model_pattern: "(^|[/_-])(gpt|o[1-9]|codex)([-/_.]|$)|openai".into(),
+            display_name: "OpenAI Reasoning".into(),
+            default_explore_count: 2,
+            max_explore_count: 4,
+            default_layer_depth: 2,
+            branching_threshold: 0.45,
+            confidence_threshold: 0.8,
+            context_window: "compact".into(),
+            token_budget_multiplier: 1.0,
+            guidance: "Keep checkpoints concise and outcome-focused; add one at a decision, revision, evidence update, or handoff.".into(),
+        },
         // Gemini Flash: wide/fast, many alternatives, quick convergence
         TuningProfile {
             model_pattern: "gemini.*flash".into(),
@@ -196,7 +223,29 @@ mod tests {
     #[test]
     fn default_profiles_has_at_least_seven() {
         let profiles = default_profiles();
-        assert!(profiles.len() >= 7, "expected at least 7 profiles, got {}", profiles.len());
+        assert!(
+            profiles.len() >= 9,
+            "expected at least 9 profiles, got {}",
+            profiles.len()
+        );
+    }
+
+    #[test]
+    fn sol_model_matches_sol_profile() {
+        let profiles = default_profiles();
+        for model in ["gpt-5.6-sol", "gpt-5.6", "openai/gpt-5.6-sol", "sol"] {
+            let p = get_profile_for_model(model, &profiles);
+            assert_eq!(p.display_name, "OpenAI Sol", "model {model}");
+        }
+    }
+
+    #[test]
+    fn other_openai_models_match_reasoning_profile() {
+        let profiles = default_profiles();
+        for model in ["gpt-5.3-codex", "openai/o3", "o1-pro"] {
+            let p = get_profile_for_model(model, &profiles);
+            assert_eq!(p.display_name, "OpenAI Reasoning", "model {model}");
+        }
     }
 
     #[test]
@@ -299,7 +348,12 @@ mod tests {
         let profiles = default_profiles();
         for profile in &profiles {
             let re = regex::Regex::new(&format!("(?i){}", profile.model_pattern));
-            assert!(re.is_ok(), "invalid regex in profile {}: {}", profile.display_name, profile.model_pattern);
+            assert!(
+                re.is_ok(),
+                "invalid regex in profile {}: {}",
+                profile.display_name,
+                profile.model_pattern
+            );
         }
     }
 
@@ -311,7 +365,9 @@ mod tests {
             assert!(
                 p.branching_threshold <= p.confidence_threshold,
                 "{}: branching {} > confidence {}",
-                p.display_name, p.branching_threshold, p.confidence_threshold
+                p.display_name,
+                p.branching_threshold,
+                p.confidence_threshold
             );
         }
     }
@@ -348,7 +404,10 @@ mod tests {
         std::fs::write(&bad_file, "not valid json!!!").unwrap();
         std::env::set_var("STEPWISE_PROFILES", bad_file.to_str().unwrap());
         let loaded = load_profiles();
-        assert!(loaded.len() >= 5, "invalid JSON should fall back to defaults");
+        assert!(
+            loaded.len() >= 5,
+            "invalid JSON should fall back to defaults"
+        );
 
         // 3. Empty array is valid JSON — returns 0 profiles
         let empty_file = tmp.path().join("empty_profiles.json");
@@ -362,7 +421,10 @@ mod tests {
         std::fs::create_dir(&dir_path).unwrap();
         std::env::set_var("STEPWISE_PROFILES", dir_path.to_str().unwrap());
         let loaded = load_profiles();
-        assert!(loaded.len() >= 5, "unreadable file should fall back to defaults");
+        assert!(
+            loaded.len() >= 5,
+            "unreadable file should fall back to defaults"
+        );
 
         // 5. No env var — defaults
         std::env::remove_var("STEPWISE_PROFILES");

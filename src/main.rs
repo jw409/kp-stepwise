@@ -1,7 +1,7 @@
 mod logging;
+mod planner;
 mod profiles;
 mod server;
-mod planner;
 
 use tracing_subscriber::EnvFilter;
 

@@ -3,7 +3,7 @@
 ## Prior Art
 
 Epic `game1-cght` (closed) implemented three components:
-1. **Scavenger parser** — harvests `var/stepwise_logs/*.jsonl` into learning pipeline
+1. **Local log parser** — reads explicitly enabled `var/stepwise_logs/*/channels/*.jsonl` workflow checkpoints
 2. **PRIM rules** — extracts IF-THEN rules predicting correction likelihood from plan patterns
 3. **CMA-ES optimizer** — auto-tunes profile parameters (exploreCount, branchingThreshold, etc.) per model
 
@@ -12,15 +12,15 @@ All three were Python, operating on the TypeScript server's JSONL output. The Ru
 ## Current State (v0.2)
 
 ```
-Step In → Validate → Track Usage → Log JSONL → Response Out
+Step In → Route(room, channel) → Validate → Track Usage → Log JSONL → Response Out
                                               ↓                ↓
-                              var/stepwise_logs/   DECIDE() decision tree
-                              {session}.jsonl                 (compressed, profile-adaptive)
+                     var/stepwise_logs/{room}/     DECIDE() decision tree
+                     channels/{channel}.jsonl     (compressed, profile-adaptive)
 ```
 
 Branching + merge step structure. 7 model profiles (Gemini Flash/Pro/catch-all,
 DeepSeek, Grok, Claude, Llama/Nemotron). Compressed decision-tree guidance (~120 tokens).
-JSONL logging unchanged. No feedback loop yet.
+Each room/channel has isolated history and heuristics. No feedback loop yet.
 
 See CONTRIBUTING.txt for the adaptive guidance loading roadmap (Phase 2-4).
 
@@ -37,7 +37,7 @@ Session N:
   kp-stepwise → JSONL logs
                                 ↓
 Between sessions:
-  scavenger harvests logs
+  local analyzer reads opted-in logs
   correlates with session outcomes (corrections, acceptances)
   PRIM extracts rules
   CMA-ES optimizes profile params
@@ -126,8 +126,8 @@ pub merge_from: Option<Vec<u32>>,  // step numbers to synthesize
 
 **How it works**:
 1. Planning server logs process metrics in JSONL (already does this)
-2. Session archive logs user messages (already does this via Claude Code)
-3. Scavenger joins on session_id: plan patterns → user responses within N turns
+2. An optional local outcome adapter records coarse workflow outcomes; it does not copy conversation text or non-checkpoint model state
+3. The analyzer joins on `(session_id, room_id, channel_id)`: checkpoint patterns → opted-in outcome summaries within N turns
 4. PRIM extracts rules: "IF branch_rate < 0.1 AND explore_count = 1 THEN correction_rate > 0.4"
 5. CMA-ES optimizes profile params to minimize correction_rate while keeping step_count reasonable
 
@@ -158,7 +158,7 @@ pub merge_from: Option<Vec<u32>>,  // step numbers to synthesize
 
 ### Phase 2: Scavenger Integration (Python, batch)
 - Update scavenger parser for new JSONL fields
-- Add session_id join with Claude Code session archives
+- Add session_id join with explicit local outcome summaries
 - Implement correction density calculation
 - Store process→outcome correlations
 
@@ -183,6 +183,8 @@ pub merge_from: Option<Vec<u32>>,  // step numbers to synthesize
 
 - **Not replacing the Python pipeline**: Batch analytics stays in Python. The Rust server is the data producer and profile consumer.
 - **Not building a full ML system**: PRIM + CMA-ES is the right level of sophistication. No neural nets, no gradient descent.
+- **Local workflow scope only**: analysis is per-workflow and limited to external checkpoint structure plus user-authorized outcome summaries. There is no cross-user corpus or substitute-model training.
+- **Not requiring full-content logs**: metadata mode is sufficient for structural metrics; full content is an explicit local choice.
 - **Not BMAD**: The planning pipeline is domain-agnostic. BMAD's role-based personas are a separate concern.
 
 ## Dependencies

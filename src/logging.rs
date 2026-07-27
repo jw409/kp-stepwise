@@ -5,37 +5,121 @@ use std::path::{Path, PathBuf};
 
 use crate::planner::StepData;
 
-/// Persistent JSONL logger that appends step records to
-/// `var/stepwise_logs/{session_id}.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogMode {
+    Off,
+    Metadata,
+    Full,
+}
+
+impl LogMode {
+    fn from_env() -> Self {
+        if let Ok(mode) = std::env::var("KP_STEPWISE_LOG_MODE") {
+            return Self::parse(&mode);
+        }
+
+        if std::env::var("DISABLE_STEP_LOGGING")
+            .or_else(|_| std::env::var("DISABLE_THOUGHT_LOGGING"))
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"))
+        {
+            return Self::Off;
+        }
+
+        Self::Full
+    }
+
+    fn parse(mode: &str) -> Self {
+        match mode.to_lowercase().as_str() {
+            "off" => Self::Off,
+            "metadata" => Self::Metadata,
+            "full" => Self::Full,
+            other => {
+                tracing::warn!(mode = other, "invalid KP_STEPWISE_LOG_MODE; using full");
+                Self::Full
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Metadata => "metadata",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Persistent JSONL logger that appends channel-scoped step records to
+/// `var/stepwise_logs/{room_id}/channels/{channel_id}.jsonl`.
 pub struct PersistentLogger {
     session_id: String,
+    room_id: String,
+    channel_id: String,
     log_file: Option<PathBuf>,
     project_path: String,
     model_id: String,
     client_type: String,
     profile_name: String,
+    log_mode: LogMode,
 }
 
 impl PersistentLogger {
+    #[allow(dead_code)] // Retained for single-channel embedders and unit tests.
     pub fn new(model_id: &str, client_type: &str, profile_name: &str) -> Self {
         let session_id = Self::resolve_session_id();
-        let project_path = Self::resolve_project_path();
-        let log_dir = Self::resolve_log_dir(&project_path);
-        let log_file = log_dir.map(|d| d.join(format!("{}.jsonl", session_id)));
+        Self::new_scoped(
+            model_id,
+            client_type,
+            profile_name,
+            &session_id,
+            &session_id,
+            "main",
+        )
+    }
 
-        if let Some(ref lf) = log_file {
+    pub fn new_scoped(
+        model_id: &str,
+        client_type: &str,
+        profile_name: &str,
+        session_id: &str,
+        room_id: &str,
+        channel_id: &str,
+    ) -> Self {
+        let project_path = Self::resolve_project_path();
+        let requested_log_mode = LogMode::from_env();
+        let log_root = (requested_log_mode != LogMode::Off)
+            .then(|| Self::resolve_log_dir(&project_path))
+            .flatten();
+        let log_file = log_root.and_then(|root| {
+            let channel_dir = root.join(room_id).join("channels");
+            fs::create_dir_all(&channel_dir)
+                .ok()
+                .map(|_| channel_dir.join(format!("{channel_id}.jsonl")))
+        });
+        let log_mode = if requested_log_mode != LogMode::Off && log_file.is_none() {
+            LogMode::Off
+        } else {
+            requested_log_mode
+        };
+
+        if requested_log_mode == LogMode::Off {
+            tracing::info!("persistent JSONL logging disabled");
+        } else if let Some(ref lf) = log_file {
             tracing::info!(path = %lf.display(), "JSONL logging enabled");
         } else {
             tracing::warn!("could not create log directory, persistent logging disabled");
         }
 
         Self {
-            session_id,
+            session_id: session_id.to_string(),
+            room_id: room_id.to_string(),
+            channel_id: channel_id.to_string(),
             log_file,
             project_path,
             model_id: model_id.to_string(),
             client_type: client_type.to_string(),
             profile_name: profile_name.to_string(),
+            log_mode,
         }
     }
 
@@ -45,14 +129,18 @@ impl PersistentLogger {
             return;
         };
 
-        let record = json!({
+        let mut record = json!({
+            "schemaVersion": 2,
+            "recordType": "workflow_checkpoint",
+            "eventId": uuid::Uuid::new_v4().to_string(),
             "timestamp": Utc::now().to_rfc3339(),
             "sessionId": self.session_id,
+            "roomId": self.room_id,
+            "channelId": self.channel_id,
             "projectPath": self.project_path,
             "clientType": self.client_type,
             "modelId": self.model_id,
             "profile": self.profile_name,
-            "step": step.step,
             "stepNumber": step.step_number,
             "totalSteps": step.total_steps,
             "nextStepNeeded": step.next_step_needed,
@@ -60,14 +148,29 @@ impl PersistentLogger {
             "revisesStep": step.revises_step,
             "branchFromStep": step.branch_from_step,
             "branchId": step.branch_id,
+            "turnId": step.turn_id,
+            "checkpointKind": step.checkpoint_kind,
             "continuationMode": step.continuation_mode,
             "exploreCount": step.explore_count,
-            "proposals": step.proposals,
             "layer": step.layer,
             "confidence": step.confidence,
             "doneReason": step.done_reason,
-            "searchQuery": step.search_query,
+            "hasEvidence": step.evidence.as_ref().is_some_and(|items| !items.is_empty()),
+            "hasOpenQuestions": step.open_questions.as_ref().is_some_and(|items| !items.is_empty()),
+            "hasNextAction": step.next_action.is_some(),
         });
+
+        if self.log_mode == LogMode::Full {
+            // `step` is retained for existing local analytics. `checkpoint`
+            // states the field's intended semantics for new consumers.
+            record["step"] = json!(step.step);
+            record["checkpoint"] = json!(step.step);
+            record["evidence"] = json!(step.evidence);
+            record["openQuestions"] = json!(step.open_questions);
+            record["nextAction"] = json!(step.next_action);
+            record["proposals"] = json!(step.proposals);
+            record["searchQuery"] = json!(step.search_query);
+        }
 
         let line = match serde_json::to_string(&record) {
             Ok(s) => s + "\n",
@@ -91,12 +194,36 @@ impl PersistentLogger {
         }
     }
 
-    fn resolve_session_id() -> String {
-        std::env::var("CLAUDE_SESSION_ID")
+    pub(crate) fn resolve_session_id() -> String {
+        let raw = std::env::var("STEPWISE_SESSION_ID")
+            .or_else(|_| std::env::var("CODEX_THREAD_ID"))
+            .or_else(|_| std::env::var("CLAUDE_SESSION_ID"))
             .or_else(|_| std::env::var("TALENTOS_SESSION_ID"))
             .unwrap_or_else(|_| {
-                format!("st-{}-{}", Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8])
+                format!(
+                    "st-{}-{}",
+                    Utc::now().timestamp_millis(),
+                    &uuid::Uuid::new_v4().to_string()[..8]
+                )
+            });
+
+        let sanitized: String = raw
+            .chars()
+            .take(128)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
             })
+            .collect();
+
+        if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+            format!("st-{}", &uuid::Uuid::new_v4().to_string()[..8])
+        } else {
+            sanitized
+        }
     }
 
     fn resolve_project_path() -> String {
@@ -111,20 +238,44 @@ impl PersistentLogger {
 
     /// Test-friendly constructor that takes an explicit log file path.
     #[cfg(test)]
-    pub(crate) fn new_with_path(log_file: Option<PathBuf>, model_id: &str, client_type: &str, profile_name: &str) -> Self {
+    pub(crate) fn new_with_path(
+        log_file: Option<PathBuf>,
+        model_id: &str,
+        client_type: &str,
+        profile_name: &str,
+    ) -> Self {
         Self {
             session_id: "test-session".into(),
+            room_id: "test-room".into(),
+            channel_id: "test-channel".into(),
             log_file,
             project_path: "/test".into(),
             model_id: model_id.into(),
             client_type: client_type.into(),
             profile_name: profile_name.into(),
+            log_mode: LogMode::Full,
         }
     }
 
     #[allow(dead_code)] // Available for diagnostics
     pub(crate) fn log_file_path(&self) -> Option<&Path> {
         self.log_file.as_deref()
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn room_id(&self) -> &str {
+        &self.room_id
+    }
+
+    pub(crate) fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub(crate) fn log_mode(&self) -> &str {
+        self.log_mode.as_str()
     }
 
     fn resolve_log_dir(project_path: &str) -> Option<PathBuf> {
@@ -135,10 +286,8 @@ impl PersistentLogger {
 
         for dir in &candidates {
             if let Some(parent) = dir.parent() {
-                if Path::new(parent).exists() {
-                    if fs::create_dir_all(dir).is_ok() {
-                        return Some(dir.clone());
-                    }
+                if Path::new(parent).exists() && fs::create_dir_all(dir).is_ok() {
+                    return Some(dir.clone());
                 }
             }
         }
@@ -158,6 +307,11 @@ mod tests {
             step_number: num,
             total_steps: 5,
             next_step_needed: true,
+            turn_id: Some(format!("turn-{}", num)),
+            checkpoint_kind: Some("observation".into()),
+            evidence: Some(vec!["unit test".into()]),
+            open_questions: None,
+            next_action: Some("continue".into()),
             is_revision: None,
             revises_step: None,
             branch_from_step: None,
@@ -209,11 +363,45 @@ mod tests {
 
         let record: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(record["step"], "Test step 1");
+        assert_eq!(record["checkpoint"], "Test step 1");
+        assert_eq!(record["recordType"], "workflow_checkpoint");
+        assert_eq!(record["schemaVersion"], 2);
+        assert_eq!(record["turnId"], "turn-1");
+        assert_eq!(record["checkpointKind"], "observation");
+        assert_eq!(record["roomId"], "test-room");
+        assert_eq!(record["channelId"], "test-channel");
         assert_eq!(record["stepNumber"], 1);
         assert_eq!(record["totalSteps"], 5);
         assert_eq!(record["confidence"], 0.7);
         assert!(record["timestamp"].is_string());
         assert!(record["sessionId"].is_string());
+    }
+
+    #[test]
+    fn metadata_mode_omits_workflow_content_but_keeps_audit_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut logger = make_logger_in_tmp(&tmp);
+        logger.log_mode = LogMode::Metadata;
+        logger.persist(&make_test_step(1));
+
+        let content = fs::read_to_string(logger.log_file_path().unwrap()).unwrap();
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert!(record.get("step").is_none());
+        assert!(record.get("checkpoint").is_none());
+        assert!(record.get("evidence").is_none());
+        assert_eq!(record["hasEvidence"], true);
+        assert_eq!(record["hasNextAction"], true);
+        assert_eq!(record["recordType"], "workflow_checkpoint");
+    }
+
+    #[test]
+    fn session_id_is_safe_for_use_as_a_filename() {
+        std::env::set_var("STEPWISE_SESSION_ID", "../../turn / one");
+        let session_id = PersistentLogger::resolve_session_id();
+        std::env::remove_var("STEPWISE_SESSION_ID");
+
+        assert_eq!(session_id, ".._.._turn___one");
+        assert!(!session_id.contains('/'));
     }
 
     #[test]
@@ -309,17 +497,49 @@ mod tests {
 
         // Set env vars to control the constructor behavior
         std::env::set_var("TALENTOS_PROJECT_PATH", tmp.path().to_str().unwrap());
+        std::env::set_var("KP_STEPWISE_LOG_MODE", "full");
         std::env::remove_var("CLAUDE_SESSION_ID");
         std::env::remove_var("TALENTOS_SESSION_ID");
 
         let logger = PersistentLogger::new("test-model", "test-client", "Default");
 
         std::env::remove_var("TALENTOS_PROJECT_PATH");
+        std::env::remove_var("KP_STEPWISE_LOG_MODE");
 
         // Should have created a log file path
         assert!(logger.log_file_path().is_some());
         let path = logger.log_file_path().unwrap();
         assert!(path.to_str().unwrap().contains("stepwise_logs"));
+        assert!(path.to_str().unwrap().contains("channels"));
+        assert!(path.ends_with("main.jsonl"));
+    }
+
+    #[test]
+    fn scoped_logger_uses_room_and_channel_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("var")).unwrap();
+        std::env::set_var("TALENTOS_PROJECT_PATH", tmp.path().to_str().unwrap());
+        std::env::set_var("KP_STEPWISE_LOG_MODE", "full");
+
+        let logger = PersistentLogger::new_scoped(
+            "test-model",
+            "test-client",
+            "Default",
+            "host-session",
+            "repair-eval",
+            "opus-gold-type",
+        );
+
+        std::env::remove_var("TALENTOS_PROJECT_PATH");
+        std::env::remove_var("KP_STEPWISE_LOG_MODE");
+
+        assert_eq!(logger.session_id(), "host-session");
+        assert_eq!(logger.room_id(), "repair-eval");
+        assert_eq!(logger.channel_id(), "opus-gold-type");
+        assert!(logger
+            .log_file_path()
+            .unwrap()
+            .ends_with("repair-eval/channels/opus-gold-type.jsonl"));
     }
 
     #[test]

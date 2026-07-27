@@ -7,10 +7,12 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use crate::profiles;
+use crate::logging::PersistentLogger;
 use crate::planner::{PlanEngine, StepData};
+use crate::profiles;
 
 // ============================================================================
 // MCP Parameter struct — maps to the tool's JSON Schema
@@ -20,7 +22,14 @@ use crate::planner::{PlanEngine, StepData};
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct StepwisePlanParams {
-    /// The current step in your working plan
+    /// Independent planner lane within a room. Every parallel agent must use a unique channel ID.
+    pub channel_id: String,
+
+    /// Shared orchestration scope. Defaults to the MCP host session when omitted.
+    #[serde(default)]
+    pub room_id: Option<String>,
+
+    /// Concise, externally reviewable checkpoint: conclusion, evidence update, decision, or next action
     #[serde(alias = "thought")]
     pub step: String,
 
@@ -33,6 +42,26 @@ pub struct StepwisePlanParams {
     #[schemars(range(min = 1))]
     #[serde(alias = "totalThoughts")]
     pub total_steps: u32,
+
+    /// Stable caller-defined turn ID for grouping checkpoints across a multi-turn workflow
+    #[serde(default)]
+    pub turn_id: Option<String>,
+
+    /// Checkpoint type: observation, hypothesis, decision, action, result, revision, or handoff
+    #[serde(default)]
+    pub checkpoint_kind: Option<String>,
+
+    /// Short evidence references supporting this checkpoint (files, tests, tool results, or facts)
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+
+    /// Unresolved questions that should survive into later turns
+    #[serde(default)]
+    pub open_questions: Option<Vec<String>>,
+
+    /// Concrete next action, if one is known
+    #[serde(default)]
+    pub next_action: Option<String>,
 
     /// Whether another step is needed (backwards compat, prefer continuation_mode)
     #[serde(default, alias = "nextThoughtNeeded")]
@@ -123,6 +152,11 @@ impl From<StepwisePlanParams> for StepData {
             step_number: p.step_number,
             total_steps: p.total_steps,
             next_step_needed: p.next_step_needed.unwrap_or(true),
+            turn_id: p.turn_id,
+            checkpoint_kind: p.checkpoint_kind,
+            evidence: p.evidence,
+            open_questions: p.open_questions,
+            next_action: p.next_action,
             is_revision: p.is_revision,
             revises_step: p.revises_step,
             branch_from_step: p.branch_from_step,
@@ -149,22 +183,132 @@ impl From<StepwisePlanParams> for StepData {
 // MCP Server
 // ============================================================================
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChannelRoute {
+    room_id: String,
+    channel_id: String,
+}
+
+type SharedEngine = Arc<Mutex<PlanEngine>>;
+
 pub struct StepwiseServer {
-    engine: Mutex<PlanEngine>,
+    engines: Mutex<HashMap<ChannelRoute, SharedEngine>>,
+    profile: profiles::TuningProfile,
+    model_id: String,
+    client_type: String,
+    session_id: String,
+    default_room_id: String,
     tool_router: ToolRouter<Self>,
+}
+
+impl StepwiseServer {
+    fn new(
+        profile: profiles::TuningProfile,
+        model_id: String,
+        client_type: String,
+        session_id: String,
+    ) -> Self {
+        Self {
+            engines: Mutex::new(HashMap::new()),
+            profile,
+            model_id,
+            client_type,
+            default_room_id: session_id.clone(),
+            session_id,
+            tool_router: StepwiseServer::tool_router(),
+        }
+    }
+
+    fn engine_for(&self, route: &ChannelRoute) -> Result<SharedEngine, McpError> {
+        let mut engines = self.engines.lock().map_err(|e| {
+            McpError::internal_error(format!("engine registry lock poisoned: {e}"), None)
+        })?;
+
+        Ok(engines
+            .entry(route.clone())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(PlanEngine::new_scoped(
+                    self.profile.clone(),
+                    self.model_id.clone(),
+                    self.client_type.clone(),
+                    &self.session_id,
+                    &route.room_id,
+                    &route.channel_id,
+                )))
+            })
+            .clone())
+    }
+
+    fn existing_engine(&self, route: &ChannelRoute) -> Result<Option<SharedEngine>, McpError> {
+        let engines = self.engines.lock().map_err(|e| {
+            McpError::internal_error(format!("engine registry lock poisoned: {e}"), None)
+        })?;
+        Ok(engines.get(route).cloned())
+    }
+
+    fn validate_route_id(kind: &str, value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err(format!("{kind} must be non-empty"));
+        }
+        if value.len() > 128 {
+            return Err(format!("{kind} must be at most 128 bytes"));
+        }
+        if matches!(value, "." | "..") {
+            return Err(format!("{kind} cannot be '.' or '..'"));
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!(
+                "{kind} may contain only ASCII letters, digits, '-', '_', and '.'"
+            ));
+        }
+        Ok(())
+    }
+
+    fn tool_error(message: impl Into<String>) -> CallToolResult {
+        let err_json = serde_json::json!({
+            "error": message.into(),
+            "status": "failed"
+        });
+        let text = serde_json::to_string_pretty(&err_json).unwrap_or_default();
+        CallToolResult::error(vec![Content::text(text)])
+    }
 }
 
 #[rmcp::tool_router]
 impl StepwiseServer {
-    /// Stepwise planning for multi-step problem-solving with branching and exploration.
+    /// Maintain a concise, inspectable decision ledger across turns. Record only externally reviewable conclusions, evidence, alternatives, and next actions.
     #[rmcp::tool(name = "stepwise_plan")]
     fn stepwise_plan(
         &self,
         Parameters(params): Parameters<StepwisePlanParams>,
     ) -> Result<CallToolResult, McpError> {
+        let route = ChannelRoute {
+            room_id: params
+                .room_id
+                .clone()
+                .unwrap_or_else(|| self.default_room_id.clone()),
+            channel_id: params.channel_id.clone(),
+        };
+
+        if let Err(message) = Self::validate_route_id("roomId", &route.room_id)
+            .and_then(|_| Self::validate_route_id("channelId", &route.channel_id))
+        {
+            return Ok(Self::tool_error(message));
+        }
+
         let data: StepData = params.into();
-        let mut engine = self.engine.lock().map_err(|e| {
-            McpError::internal_error(format!("engine lock poisoned: {}", e), None)
+        let engine = self.engine_for(&route)?;
+        let mut engine = engine.lock().map_err(|e| {
+            McpError::internal_error(
+                format!(
+                    "engine lock poisoned for room '{}' channel '{}': {e}",
+                    route.room_id, route.channel_id
+                ),
+                None,
+            )
         })?;
 
         match engine.process(data) {
@@ -172,14 +316,7 @@ impl StepwiseServer {
                 let text = serde_json::to_string_pretty(&response).unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
-            Err(msg) => {
-                let err_json = serde_json::json!({
-                    "error": msg,
-                    "status": "failed"
-                });
-                let text = serde_json::to_string_pretty(&err_json).unwrap_or_default();
-                Ok(CallToolResult::error(vec![Content::text(text)]))
-            }
+            Err(msg) => Ok(Self::tool_error(msg)),
         }
     }
 }
@@ -197,7 +334,9 @@ impl ServerHandler for StepwiseServer {
                 website_url: None,
             },
             capabilities: rmcp::model::ServerCapabilities {
-                tools: Some(rmcp::model::ToolsCapability { list_changed: Some(true) }),
+                tools: Some(rmcp::model::ToolsCapability {
+                    list_changed: Some(true),
+                }),
                 resources: Some(rmcp::model::ResourcesCapability::default()),
                 ..Default::default()
             },
@@ -216,11 +355,39 @@ impl ServerHandler for StepwiseServer {
         let templates = vec![
             Annotated::new(
                 RawResourceTemplate {
-                    uri_template: "stepwise://sessions/current/steps".into(),
-                    name: "current_steps".into(),
-                    title: Some("Current Session Steps".into()),
+                    uri_template: "stepwise://rooms/{roomId}/channels".into(),
+                    name: "room_channels".into(),
+                    title: Some("Room Channels".into()),
                     description: Some(
-                        "Returns the current session's step history as compressed JSON"
+                        "Lists independently isolated planner channels in a room".into(),
+                    ),
+                    mime_type: Some("application/json".into()),
+                    icons: None,
+                },
+                None,
+            ),
+            Annotated::new(
+                RawResourceTemplate {
+                    uri_template:
+                        "stepwise://rooms/{roomId}/channels/{channelId}/steps".into(),
+                    name: "channel_steps".into(),
+                    title: Some("Channel Steps".into()),
+                    description: Some(
+                        "Returns one channel's external checkpoint history as compressed JSON".into(),
+                    ),
+                    mime_type: Some("application/json".into()),
+                    icons: None,
+                },
+                None,
+            ),
+            Annotated::new(
+                RawResourceTemplate {
+                    uri_template:
+                        "stepwise://rooms/{roomId}/channels/{channelId}/session".into(),
+                    name: "channel_session".into(),
+                    title: Some("Channel Metadata".into()),
+                    description: Some(
+                        "Returns room/channel identity, profile, logging, and expected next checkpoint"
                             .into(),
                     ),
                     mime_type: Some("application/json".into()),
@@ -230,11 +397,12 @@ impl ServerHandler for StepwiseServer {
             ),
             Annotated::new(
                 RawResourceTemplate {
-                    uri_template: "stepwise://sessions/current/branches".into(),
-                    name: "current_branches".into(),
-                    title: Some("Current Session Branches".into()),
+                    uri_template:
+                        "stepwise://rooms/{roomId}/channels/{channelId}/branches".into(),
+                    name: "channel_branches".into(),
+                    title: Some("Channel Branches".into()),
                     description: Some(
-                        "Returns branch names and step counts for the current session".into(),
+                        "Returns branch names and step counts for one isolated channel".into(),
                     ),
                     mime_type: Some("application/json".into()),
                     icons: None,
@@ -243,11 +411,12 @@ impl ServerHandler for StepwiseServer {
             ),
             Annotated::new(
                 RawResourceTemplate {
-                    uri_template: "stepwise://sessions/current/stats".into(),
-                    name: "current_stats".into(),
-                    title: Some("Current Session Usage Stats".into()),
+                    uri_template:
+                        "stepwise://rooms/{roomId}/channels/{channelId}/stats".into(),
+                    name: "channel_stats".into(),
+                    title: Some("Channel Usage Stats".into()),
                     description: Some(
-                        "Returns usage stats for the current session".into(),
+                        "Returns confidence and branching heuristics for one isolated channel".into(),
                     ),
                     mime_type: Some("application/json".into()),
                     icons: None,
@@ -259,78 +428,158 @@ impl ServerHandler for StepwiseServer {
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
     }
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
-        async move {
-            let uri = &request.uri;
+    ) -> Result<ReadResourceResult, McpError> {
+        let uri = &request.uri;
+        let path = uri.strip_prefix("stepwise://rooms/").ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "Unknown resource URI: {uri}. Use stepwise://rooms/{{roomId}}/channels/..."
+                ),
+                None,
+            )
+        })?;
+        let segments: Vec<&str> = path.split('/').collect();
 
-            let path = uri
-                .strip_prefix("stepwise://sessions/current/")
-                .ok_or_else(|| {
-                    McpError::invalid_params(format!("Unknown resource URI: {uri}"), None)
+        if segments.len() == 2 && segments[1] == "channels" {
+            let room_id = segments[0];
+            Self::validate_route_id("roomId", room_id)
+                .map_err(|message| McpError::invalid_params(message, None))?;
+
+            let channel_engines: Vec<(String, SharedEngine)> = {
+                let engines = self.engines.lock().map_err(|e| {
+                    McpError::internal_error(format!("engine registry lock poisoned: {e}"), None)
                 })?;
-
-            let engine = self.engine.lock().map_err(|e| {
-                McpError::internal_error(format!("engine lock poisoned: {e}"), None)
-            })?;
-
-            let json_text = match path {
-                "steps" => {
-                    let history = engine.step_history();
-                    let compact: Vec<serde_json::Value> = history
-                        .iter()
-                        .map(|t| {
-                            serde_json::json!({
-                                "n": t.step_number,
-                                "total": t.total_steps,
-                                "step": t.step,
-                                "confidence": t.confidence,
-                                "branch": t.branch_id,
-                                "layer": t.layer,
-                                "mode": t.continuation_mode,
-                            })
-                        })
-                        .collect();
-                    serde_json::to_string(&compact).unwrap_or_default()
-                }
-                "branches" => {
-                    let branches = engine.branches();
-                    let summary: serde_json::Value = branches
-                        .iter()
-                        .map(|(name, steps)| {
-                            (name.clone(), serde_json::json!(steps.len()))
-                        })
-                        .collect::<serde_json::Map<String, serde_json::Value>>()
-                        .into();
-                    serde_json::to_string(&summary).unwrap_or_default()
-                }
-                "stats" => {
-                    let stats = engine.usage_stats();
-                    serde_json::to_string(&stats).unwrap_or_default()
-                }
-                other => {
-                    return Err(McpError::invalid_params(
-                        format!("Unknown resource path: {other}"),
-                        None,
-                    ));
-                }
+                engines
+                    .iter()
+                    .filter(|(route, _)| route.room_id == room_id)
+                    .map(|(route, engine)| (route.channel_id.clone(), engine.clone()))
+                    .collect()
             };
 
-            Ok(ReadResourceResult {
+            let mut channels = Vec::with_capacity(channel_engines.len());
+            for (channel_id, engine) in channel_engines {
+                let engine = engine.lock().map_err(|e| {
+                    McpError::internal_error(
+                        format!(
+                            "engine lock poisoned for room '{room_id}' channel '{channel_id}': {e}"
+                        ),
+                        None,
+                    )
+                })?;
+                channels.push(engine.session_info());
+            }
+            channels.sort_by(|a, b| a["channelId"].as_str().cmp(&b["channelId"].as_str()));
+
+            let json_text = serde_json::to_string(&serde_json::json!({
+                "roomId": room_id,
+                "channelCount": channels.len(),
+                "channels": channels,
+            }))
+            .unwrap_or_default();
+
+            return Ok(ReadResourceResult {
                 contents: vec![ResourceContents::text(json_text, &request.uri)],
-            })
+            });
         }
+
+        if segments.len() != 4 || segments[1] != "channels" {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Unknown resource URI: {uri}. Expected stepwise://rooms/{{roomId}}/channels or stepwise://rooms/{{roomId}}/channels/{{channelId}}/{{steps|branches|stats|session}}"
+                ),
+                None,
+            ));
+        }
+
+        let route = ChannelRoute {
+            room_id: segments[0].to_string(),
+            channel_id: segments[2].to_string(),
+        };
+        Self::validate_route_id("roomId", &route.room_id)
+            .and_then(|_| Self::validate_route_id("channelId", &route.channel_id))
+            .map_err(|message| McpError::invalid_params(message, None))?;
+
+        let engine = self.existing_engine(&route)?.ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "Unknown stepwise channel: room '{}' channel '{}'",
+                    route.room_id, route.channel_id
+                ),
+                None,
+            )
+        })?;
+        let engine = engine.lock().map_err(|e| {
+            McpError::internal_error(
+                format!(
+                    "engine lock poisoned for room '{}' channel '{}': {e}",
+                    route.room_id, route.channel_id
+                ),
+                None,
+            )
+        })?;
+
+        let json_text = match segments[3] {
+            "steps" => {
+                let history = engine.step_history();
+                let compact: Vec<serde_json::Value> = history
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "n": t.step_number,
+                            "total": t.total_steps,
+                            "step": t.step,
+                            "confidence": t.confidence,
+                            "branch": t.branch_id,
+                            "layer": t.layer,
+                            "mode": t.continuation_mode,
+                            "turnId": t.turn_id,
+                            "kind": t.checkpoint_kind,
+                            "evidence": t.evidence,
+                            "openQuestions": t.open_questions,
+                            "nextAction": t.next_action,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&compact).unwrap_or_default()
+            }
+            "branches" => {
+                let branches = engine.branches();
+                let summary: serde_json::Value = branches
+                    .iter()
+                    .map(|(name, steps)| (name.clone(), serde_json::json!(steps.len())))
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+                    .into();
+                serde_json::to_string(&summary).unwrap_or_default()
+            }
+            "stats" => {
+                let stats = engine.usage_stats();
+                serde_json::to_string(&stats).unwrap_or_default()
+            }
+            "session" => serde_json::to_string(&engine.session_info()).unwrap_or_default(),
+            other => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Unknown channel resource path: {other}. Expected steps, branches, stats, or session"
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(json_text, &request.uri)],
+        })
     }
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let model_id =
-        std::env::var("STEPWISE_MODEL")
-            .or_else(|_| std::env::var("SEQUENTIAL_THINKING_MODEL")) // legacy name
-            .unwrap_or_else(|_| "unknown".into());
+    let model_id = std::env::var("STEPWISE_MODEL")
+        .or_else(|_| std::env::var("SEQUENTIAL_THINKING_MODEL")) // legacy name
+        .unwrap_or_else(|_| "unknown".into());
     let client_type = detect_client_type();
 
     let all_profiles = profiles::load_profiles();
@@ -343,14 +592,8 @@ pub async fn run() -> anyhow::Result<()> {
         "stepwise planning server ready"
     );
 
-    let server = StepwiseServer {
-        engine: Mutex::new(PlanEngine::new(
-            profile,
-            model_id,
-            client_type,
-        )),
-        tool_router: StepwiseServer::tool_router(),
-    };
+    let session_id = PersistentLogger::resolve_session_id();
+    let server = StepwiseServer::new(profile, model_id, client_type, session_id);
 
     let service = server.serve(rmcp::transport::io::stdio()).await?;
     service.waiting().await?;
@@ -358,7 +601,11 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 fn detect_client_type() -> String {
-    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_AGENT_SDK").is_ok() {
+    if std::env::var("CODEX_THREAD_ID").is_ok() {
+        "codex".into()
+    } else if std::env::var("CLAUDE_CODE_VERSION").is_ok()
+        || std::env::var("CLAUDE_AGENT_SDK").is_ok()
+    {
         "claude-code".into()
     } else if std::env::var("GEMINI_CLI").is_ok() || std::env::var("GOOGLE_CLI").is_ok() {
         "gemini-cli".into()
@@ -375,10 +622,17 @@ mod tests {
 
     fn make_params(step: &str, num: u32, total: u32) -> StepwisePlanParams {
         StepwisePlanParams {
+            channel_id: "test-main".into(),
+            room_id: Some("test-room".into()),
             step: step.into(),
             step_number: num,
             total_steps: total,
             next_step_needed: None,
+            turn_id: None,
+            checkpoint_kind: None,
+            evidence: None,
+            open_questions: None,
+            next_action: None,
             is_revision: None,
             revises_step: None,
             branch_from_step: None,
@@ -403,14 +657,12 @@ mod tests {
     fn make_server() -> StepwiseServer {
         std::env::set_var("DISABLE_STEP_LOGGING", "true");
         let profile = crate::profiles::fallback_profile();
-        StepwiseServer {
-            engine: Mutex::new(PlanEngine::new(
-                profile,
-                "test-model".into(),
-                "test-client".into(),
-            )),
-            tool_router: StepwiseServer::tool_router(),
-        }
+        StepwiseServer::new(
+            profile,
+            "test-model".into(),
+            "test-client".into(),
+            "test-session".into(),
+        )
     }
 
     // ---- From<StepwisePlanParams> for StepData ----
@@ -429,10 +681,17 @@ mod tests {
     #[test]
     fn params_to_step_data_all_optional_fields() {
         let params = StepwisePlanParams {
+            channel_id: "test-main".into(),
+            room_id: Some("test-room".into()),
             step: "test".into(),
             step_number: 2,
             total_steps: 10,
             next_step_needed: Some(false),
+            turn_id: Some("turn-2".into()),
+            checkpoint_kind: Some("decision".into()),
+            evidence: Some(vec!["test output".into()]),
+            open_questions: Some(vec!["rollout risk".into()]),
+            next_action: Some("implement".into()),
             is_revision: Some(true),
             revises_step: Some(1),
             branch_from_step: Some(1),
@@ -454,6 +713,11 @@ mod tests {
         };
         let data: StepData = params.into();
         assert!(!data.next_step_needed);
+        assert_eq!(data.turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(data.checkpoint_kind.as_deref(), Some("decision"));
+        assert_eq!(data.evidence.as_ref().unwrap(), &["test output"]);
+        assert_eq!(data.open_questions.as_ref().unwrap(), &["rollout risk"]);
+        assert_eq!(data.next_action.as_deref(), Some("implement"));
         assert_eq!(data.is_revision, Some(true));
         assert_eq!(data.revises_step, Some(1));
         assert_eq!(data.branch_from_step, Some(1));
@@ -478,7 +742,12 @@ mod tests {
 
     /// Extract the text string from the first content item of a CallToolResult.
     fn extract_text(result: &CallToolResult) -> String {
-        result.content[0].raw.as_text().expect("expected text content").text.clone()
+        result.content[0]
+            .raw
+            .as_text()
+            .expect("expected text content")
+            .text
+            .clone()
     }
 
     #[test]
@@ -493,6 +762,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["stepNumber"], 1);
         assert_eq!(parsed["totalSteps"], 5);
+        assert!(parsed["sessionId"].is_string());
+        assert_eq!(parsed["roomId"], "test-room");
+        assert_eq!(parsed["channelId"], "test-main");
+        assert!(parsed["logMode"].is_string());
         assert!(parsed.get("firstCallGuidance").is_some());
     }
 
@@ -538,6 +811,47 @@ mod tests {
         assert!(branches.iter().any(|b| b.as_str() == Some("alt-path")));
     }
 
+    #[test]
+    fn parallel_channels_have_independent_histories_and_counters() {
+        let server = make_server();
+
+        let mut agent_a = make_params("Agent A first", 1, 3);
+        agent_a.channel_id = "agent-a".into();
+        agent_a.confidence = Some(0.2);
+        let result_a = server.stepwise_plan(Parameters(agent_a)).unwrap();
+        let parsed_a: serde_json::Value = serde_json::from_str(&extract_text(&result_a)).unwrap();
+
+        let mut agent_b = make_params("Agent B first", 1, 3);
+        agent_b.channel_id = "agent-b".into();
+        agent_b.confidence = Some(0.9);
+        let result_b = server.stepwise_plan(Parameters(agent_b)).unwrap();
+        let parsed_b: serde_json::Value = serde_json::from_str(&extract_text(&result_b)).unwrap();
+
+        assert_eq!(parsed_a["stepCount"], 1);
+        assert_eq!(parsed_b["stepCount"], 1);
+        assert_eq!(parsed_a["channelId"], "agent-a");
+        assert_eq!(parsed_b["channelId"], "agent-b");
+        assert_eq!(parsed_a["usageStats"]["lowConfWithoutBranchCount"], 1);
+        assert_eq!(parsed_b["usageStats"]["lowConfWithoutBranchCount"], 0);
+        assert_eq!(server.engines.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn invalid_route_ids_are_rejected_without_creating_state() {
+        let server = make_server();
+        let mut params = make_params("Bad route", 1, 2);
+        params.channel_id = "../agent".into();
+
+        let result = server.stepwise_plan(Parameters(params)).unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        let parsed: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("channelId may contain only"));
+        assert!(server.engines.lock().unwrap().is_empty());
+    }
+
     // ---- get_info ----
 
     #[test]
@@ -545,7 +859,12 @@ mod tests {
         let server = make_server();
         let info = server.get_info();
         assert_eq!(info.server_info.name, "kp-stepwise");
-        assert!(info.server_info.title.as_deref().unwrap().contains("Stepwise Planning"));
+        assert!(info
+            .server_info
+            .title
+            .as_deref()
+            .unwrap()
+            .contains("Stepwise Planning"));
     }
 
     // ---- detect_client_type ----
@@ -555,9 +874,9 @@ mod tests {
     #[test]
     fn tool_method_poisoned_lock_returns_error() {
         let server = make_server();
-        // Poison the mutex by panicking inside a lock
+        // Poison the registry mutex by panicking inside a lock.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = server.engine.lock().unwrap();
+            let _guard = server.engines.lock().unwrap();
             panic!("intentional panic to poison the mutex");
         }));
         // Now the mutex is poisoned
@@ -645,6 +964,7 @@ mod tests {
     #[test]
     fn detect_client_type_all_branches() {
         // Clear all detection env vars first
+        std::env::remove_var("CODEX_THREAD_ID");
         std::env::remove_var("CLAUDE_CODE_VERSION");
         std::env::remove_var("CLAUDE_AGENT_SDK");
         std::env::remove_var("GEMINI_CLI");
@@ -653,6 +973,11 @@ mod tests {
 
         // Unknown
         assert_eq!(detect_client_type(), "unknown");
+
+        // Codex has highest priority
+        std::env::set_var("CODEX_THREAD_ID", "thread-1");
+        assert_eq!(detect_client_type(), "codex");
+        std::env::remove_var("CODEX_THREAD_ID");
 
         // Talentos (test last-priority first so higher-priority vars don't interfere)
         std::env::set_var("TALENTOS_AGENT", "1");

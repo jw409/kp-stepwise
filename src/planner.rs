@@ -18,6 +18,19 @@ pub struct StepData {
     #[serde(default)]
     pub next_step_needed: bool,
 
+    // External workflow metadata for continuity and inspection across turns.
+    // These fields describe externally reviewable work state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_questions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+
     // Original optional (promoted to first-class)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_revision: Option<bool>,
@@ -141,9 +154,7 @@ pub struct PlanEngine {
     step_history: Vec<StepData>,
     branches: HashMap<String, Vec<StepData>>,
     profile: TuningProfile,
-    #[allow(dead_code)] // Stored for future per-model analytics
     model_id: String,
-    #[allow(dead_code)] // Stored for future per-client analytics
     client_type: String,
     disable_logging: bool,
     logger: PersistentLogger,
@@ -155,13 +166,41 @@ pub struct PlanEngine {
 }
 
 impl PlanEngine {
+    #[allow(dead_code)] // Retained for single-channel embedders and unit tests.
     pub fn new(profile: TuningProfile, model_id: String, client_type: String) -> Self {
+        let logger = PersistentLogger::new(&model_id, &client_type, &profile.display_name);
+        Self::with_logger(profile, model_id, client_type, logger)
+    }
+
+    pub fn new_scoped(
+        profile: TuningProfile,
+        model_id: String,
+        client_type: String,
+        session_id: &str,
+        room_id: &str,
+        channel_id: &str,
+    ) -> Self {
+        let logger = PersistentLogger::new_scoped(
+            &model_id,
+            &client_type,
+            &profile.display_name,
+            session_id,
+            room_id,
+            channel_id,
+        );
+        Self::with_logger(profile, model_id, client_type, logger)
+    }
+
+    fn with_logger(
+        profile: TuningProfile,
+        model_id: String,
+        client_type: String,
+        logger: PersistentLogger,
+    ) -> Self {
         let disable_logging = std::env::var("DISABLE_STEP_LOGGING")
             .or_else(|_| std::env::var("DISABLE_THOUGHT_LOGGING")) // legacy name
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-
-        let logger = PersistentLogger::new(&model_id, &client_type, &profile.display_name);
 
         Self {
             step_history: Vec::new(),
@@ -202,9 +241,26 @@ impl PlanEngine {
         }
     }
 
+    pub(crate) fn session_info(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": self.logger.session_id(),
+            "roomId": self.logger.room_id(),
+            "channelId": self.logger.channel_id(),
+            "modelId": self.model_id,
+            "clientType": self.client_type,
+            "profile": self.profile.display_name,
+            "logMode": self.logger.log_mode(),
+            "logFile": self.logger.log_file_path().map(|path| path.display().to_string()),
+            "checkpointCount": self.step_history.len(),
+            "expectedNextStep": self.step_history.last().and_then(|step| {
+                step.next_step_needed.then(|| step.step_number.saturating_add(1))
+            }),
+        })
+    }
+
     /// Validate and clamp input fields, returning a clean StepData.
     fn validate(&self, mut data: StepData) -> Result<StepData, String> {
-        if data.step.is_empty() {
+        if data.step.trim().is_empty() {
             return Err("Invalid step: must be a non-empty string".into());
         }
         if data.step_number == 0 {
@@ -212,6 +268,28 @@ impl PlanEngine {
         }
         if data.total_steps == 0 {
             return Err("Invalid totalSteps: must be >= 1".into());
+        }
+
+        if data.turn_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+            return Err("Invalid turnId: must be non-empty when provided".into());
+        }
+
+        if let Some(ref kind) = data.checkpoint_kind {
+            const KINDS: &[&str] = &[
+                "observation",
+                "hypothesis",
+                "decision",
+                "action",
+                "result",
+                "revision",
+                "handoff",
+            ];
+            if !KINDS.contains(&kind.as_str()) {
+                return Err(format!(
+                    "Invalid checkpointKind: expected one of {}",
+                    KINDS.join(", ")
+                ));
+            }
         }
 
         // Derive nextStepNeeded from continuationMode if not explicitly set
@@ -264,10 +342,7 @@ impl PlanEngine {
                 data.branch_id.as_deref().unwrap_or("?")
             ));
         } else {
-            parts.push(format!(
-                ".. Step {}/{}",
-                data.step_number, data.total_steps
-            ));
+            parts.push(format!(".. Step {}/{}", data.step_number, data.total_steps));
         }
 
         // Extras inline
@@ -291,11 +366,18 @@ impl PlanEngine {
     }
 
     /// Process a step and return the JSON response.
-    pub fn process(
-        &mut self,
-        data: StepData,
-    ) -> Result<serde_json::Value, String> {
+    pub fn process(&mut self, data: StepData) -> Result<serde_json::Value, String> {
         let validated = self.validate(data)?;
+
+        if let Some(last) = self.step_history.last() {
+            let expected_step = last.step_number.saturating_add(1);
+            if validated.step_number != expected_step {
+                return Err(format!(
+                    "Out-of-order stepNumber: expected {expected_step}, got {}. Retry this checkpoint after the preceding call completes.",
+                    validated.step_number
+                ));
+            }
+        }
 
         self.step_history.push(validated.clone());
 
@@ -303,9 +385,7 @@ impl PlanEngine {
         self.logger.persist(&validated);
 
         // Track branches
-        if let (Some(_from), Some(ref bid)) =
-            (validated.branch_from_step, &validated.branch_id)
-        {
+        if let (Some(_from), Some(ref bid)) = (validated.branch_from_step, &validated.branch_id) {
             self.branches
                 .entry(bid.clone())
                 .or_default()
@@ -388,7 +468,8 @@ impl PlanEngine {
         }
 
         // --- Hint: confidence without layer tracking ---
-        if validated.confidence.is_some() && validated.layer.is_none() && validated.step_number >= 2 {
+        if validated.confidence.is_some() && validated.layer.is_none() && validated.step_number >= 2
+        {
             hints.push(Hint {
                 kind: "layer_available".into(),
                 message: "Confidence is tracked but layer is not set. Layers (1=problem, 2=approach, 3=details) help calibrate whether confidence is warranted at this stage.".into(),
@@ -420,16 +501,18 @@ impl PlanEngine {
         let spawn_candidate = {
             let is_wide_explore = validated.continuation_mode.as_deref() == Some("explore")
                 && validated.explore_count.unwrap_or(0) >= 3
-                && validated.proposals.as_ref().map_or(false, |p| p.len() >= 3);
+                && validated.proposals.as_ref().is_some_and(|p| p.len() >= 3);
 
             let has_uncertain_branches = self.branches.len() >= 2
                 && self.branches.values().any(|steps| {
-                    steps.last().map_or(false, |t| {
-                        t.confidence.map_or(false, |c| c < self.profile.branching_threshold)
+                    steps.last().is_some_and(|t| {
+                        t.confidence
+                            .is_some_and(|c| c < self.profile.branching_threshold)
                     })
                 });
 
-            let is_branching_with_existing = validated.continuation_mode.as_deref() == Some("branch")
+            let is_branching_with_existing = validated.continuation_mode.as_deref()
+                == Some("branch")
                 && validated.branch_from_step.is_some()
                 && self.branches.len() >= 2;
 
@@ -437,27 +520,33 @@ impl PlanEngine {
         };
 
         if spawn_candidate {
-            let branch_points: Vec<String> = if validated.continuation_mode.as_deref() == Some("explore") {
-                // For explore mode, use proposal descriptions as branch point names
-                validated.proposals.as_ref()
-                    .map(|p| p.iter().enumerate().map(|(i, _desc)| {
-                        format!("proposal-{}", i + 1)
-                    }).collect())
-                    .unwrap_or_default()
-            } else {
-                // For branch mode, use existing branch names
-                self.branches.keys().cloned().collect()
-            };
+            let branch_points: Vec<String> =
+                if validated.continuation_mode.as_deref() == Some("explore") {
+                    // For explore mode, use proposal descriptions as branch point names
+                    validated
+                        .proposals
+                        .as_ref()
+                        .map(|p| {
+                            p.iter()
+                                .enumerate()
+                                .map(|(i, _desc)| format!("proposal-{}", i + 1))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // For branch mode, use existing branch names
+                    self.branches.keys().cloned().collect()
+                };
 
             let remaining = validated.total_steps.saturating_sub(validated.step_number);
-            let recommended_depth = remaining.max(3).min(10);
+            let recommended_depth = remaining.clamp(3, 10);
 
             let recommended_model = if validated.confidence.unwrap_or(0.5) < 0.3 {
-                "stronger".to_string()  // Very uncertain = use stronger model
+                "stronger".to_string() // Very uncertain = use stronger model
             } else if validated.layer.unwrap_or(1) <= 1 {
-                "same".to_string()  // Still at problem understanding = same model
+                "same".to_string() // Still at problem understanding = same model
             } else {
-                "cheaper".to_string()  // Deeper layers with moderate confidence = cheaper OK
+                "cheaper".to_string() // Deeper layers with moderate confidence = cheaper OK
             };
 
             hints.push(Hint {
@@ -482,7 +571,8 @@ impl PlanEngine {
         // explore branches concurrently, then merge results back.
         if validated.branch_from_step.is_some() && validated.branch_id.is_some() {
             let strategy = validated.branch_strategy.as_deref().unwrap_or("sequential");
-            if strategy == "parallel" || (validated.proposals.as_ref().map_or(false, |p| p.len() >= 3)) {
+            if strategy == "parallel" || validated.proposals.as_ref().is_some_and(|p| p.len() >= 3)
+            {
                 let branch_name = validated.branch_id.as_deref().unwrap_or("unknown");
                 let proposal_count = validated.proposals.as_ref().map_or(0, |p| p.len());
                 hints.push(Hint {
@@ -503,9 +593,7 @@ impl PlanEngine {
 
         // --- Hint: multi-branch subagent orchestration ---
         // When 3+ branches exist, suggest spawning agents for each and merging
-        if self.branches.len() >= 3
-            && validated.continuation_mode.as_deref() != Some("merge")
-        {
+        if self.branches.len() >= 3 && validated.continuation_mode.as_deref() != Some("merge") {
             let branch_names: Vec<String> = self.branches.keys().cloned().collect();
             hints.push(Hint {
                 kind: "subagent_orchestration".into(),
@@ -551,14 +639,16 @@ impl PlanEngine {
                 }
 
                 // Compute convergence signal
-                let confidences: Vec<f64> = outcomes.iter()
-                    .filter_map(|o| o.final_confidence)
-                    .collect();
+                let confidences: Vec<f64> =
+                    outcomes.iter().filter_map(|o| o.final_confidence).collect();
                 let convergence_signal = if confidences.len() < 2 {
                     "insufficient".to_string()
                 } else {
                     let min = confidences.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let max = confidences.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let max = confidences
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let spread = max - min;
                     if spread <= 0.2 {
                         "converged".to_string()
@@ -599,14 +689,16 @@ impl PlanEngine {
                 }
 
                 // Compute convergence signal
-                let confidences: Vec<f64> = outcomes.iter()
-                    .filter_map(|o| o.final_confidence)
-                    .collect();
+                let confidences: Vec<f64> =
+                    outcomes.iter().filter_map(|o| o.final_confidence).collect();
                 let convergence_signal = if confidences.len() < 2 {
                     "insufficient".to_string()
                 } else {
                     let min = confidences.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let max = confidences.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let max = confidences
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let spread = max - min;
                     if spread <= 0.2 {
                         "converged".to_string()
@@ -645,7 +737,23 @@ impl PlanEngine {
             "branches": branch_keys,
             "stepCount": self.step_history.len(),
             "usageStats": usage_stats,
+            "expectedNextStep": if validated.next_step_needed {
+                Some(validated.step_number.saturating_add(1))
+            } else {
+                None
+            },
         });
+
+        response["sessionId"] = serde_json::Value::String(self.logger.session_id().into());
+        response["roomId"] = serde_json::Value::String(self.logger.room_id().into());
+        response["channelId"] = serde_json::Value::String(self.logger.channel_id().into());
+        response["logMode"] = serde_json::Value::String(self.logger.log_mode().into());
+        if let Some(ref turn_id) = validated.turn_id {
+            response["turnId"] = serde_json::Value::String(turn_id.clone());
+        }
+        if let Some(ref kind) = validated.checkpoint_kind {
+            response["checkpointKind"] = serde_json::Value::String(kind.clone());
+        }
 
         // Hints array — always present, may be empty
         if !hints.is_empty() {
@@ -653,10 +761,9 @@ impl PlanEngine {
         }
 
         // First-call guidance
-        if validated.step_number == 1 {
-            response["firstCallGuidance"] = serde_json::Value::String(
-                first_call_guidance(&self.profile),
-            );
+        if self.step_history.len() == 1 {
+            response["firstCallGuidance"] =
+                serde_json::Value::String(first_call_guidance(&self.profile));
         }
 
         // Search query passthrough
@@ -706,12 +813,14 @@ fn first_call_guidance(profile: &TuningProfile) -> String {
            converging → merge(mergeBranches:[ids])\n\
            diverging → branch deeper or delegate(delegateToNextLayer)\n\
          \n\
-         ALWAYS: set confidence. Third option exists. Verify before assuming.",
+         CHECKPOINT: conclusion + evidence + next action; external work state only.
+         PROFILE: {profile_guidance}",
         bt = bt,
         ct = ct,
         dn = profile.display_name,
         de = profile.default_explore_count,
         me = profile.max_explore_count,
+        profile_guidance = profile.guidance,
     )
 }
 
@@ -722,7 +831,7 @@ pub fn tool_description(profile: &TuningProfile) -> String {
     let ct = (profile.confidence_threshold * 100.0).round() as u32;
 
     format!(
-        "Stepwise planning for multi-step problem-solving with branching and exploration.\n\
+        "External decision ledger for multi-turn work; record checkpoints, evidence, alternatives, and next actions.\n\
          Branch <{bt}% | exit >{ct}% | modes: explore/branch/merge/continue/done | \
          {dn} explore:{de}-{me} budget:{tbm}x",
         bt = bt,
@@ -740,7 +849,7 @@ pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     let mut current = String::new();
 
     for word in text.split_whitespace() {
-        if current.len() + word.len() + 1 <= max_width {
+        if current.len() + word.len() < max_width {
             if !current.is_empty() {
                 current.push(' ');
             }
@@ -766,7 +875,7 @@ pub(crate) fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{fallback_profile, default_profiles, get_profile_for_model};
+    use crate::profiles::{default_profiles, fallback_profile, get_profile_for_model};
 
     fn make_engine() -> PlanEngine {
         std::env::set_var("DISABLE_STEP_LOGGING", "true");
@@ -780,6 +889,11 @@ mod tests {
             step_number: num,
             total_steps: total,
             next_step_needed: true,
+            turn_id: None,
+            checkpoint_kind: None,
+            evidence: None,
+            open_questions: None,
+            next_action: None,
             is_revision: None,
             revises_step: None,
             branch_from_step: None,
@@ -945,6 +1059,20 @@ mod tests {
     }
 
     #[test]
+    fn process_rejects_out_of_order_checkpoint_without_logging_it() {
+        let mut engine = make_engine();
+        engine.process(make_step(1, 5)).unwrap();
+
+        let err = engine.process(make_step(3, 5)).unwrap_err();
+        assert!(err.contains("expected 2, got 3"));
+        assert_eq!(engine.step_history().len(), 1);
+
+        let result = engine.process(make_step(2, 5)).unwrap();
+        assert_eq!(result["stepCount"], 2);
+        assert_eq!(result["expectedNextStep"], 3);
+    }
+
+    #[test]
     fn process_branch_tracking() {
         let mut engine = make_engine();
         engine.process(make_step(1, 5)).unwrap();
@@ -1051,7 +1179,7 @@ mod tests {
         let mut engine = make_engine();
         let mut t = make_step(2, 5); // not step 1, to avoid firstCallGuidance noise
         t.confidence = Some(0.3); // below 0.6 threshold
-        // Need to process step 1 first
+                                  // Need to process step 1 first
         engine.process(make_step(1, 5)).unwrap();
         let result = engine.process(t).unwrap();
         let guidance = result["guidance"].as_str().unwrap();
@@ -1158,7 +1286,7 @@ mod tests {
     fn tool_description_compact() {
         let profile = fallback_profile();
         let desc = tool_description(&profile);
-        assert!(desc.contains("Stepwise planning"));
+        assert!(desc.contains("External decision ledger"));
         assert!(desc.contains("Branch"));
         // Should be compact — no massive guidance blocks
         assert!(desc.lines().count() <= 5);
@@ -1177,7 +1305,7 @@ mod tests {
         assert!(guidance.contains("branch(branchFromStep"));
         assert!(guidance.contains("merge(mergeBranches"));
         // Compact: decision tree, not essay
-        assert!(guidance.lines().count() <= 12);
+        assert!(guidance.lines().count() <= 13);
     }
 
     // ---- engine with specific profile ----
@@ -1295,9 +1423,9 @@ mod tests {
         }
 
         // All three warning conditions met:
-        assert!(engine.consecutive_linear_steps >= 4);       // linear chain
-        assert_eq!(engine.explore_count_usage_count, 0);        // no explore_count used
-        assert!(engine.low_conf_without_branch_count >= 2);     // low-conf without branch
+        assert!(engine.consecutive_linear_steps >= 4); // linear chain
+        assert_eq!(engine.explore_count_usage_count, 0); // no explore_count used
+        assert!(engine.low_conf_without_branch_count >= 2); // low-conf without branch
     }
 
     // ---- hints system tests ----
@@ -1336,7 +1464,10 @@ mod tests {
         let hints = result["hints"].as_array().unwrap();
         assert!(hints.iter().any(|h| h["kind"] == "premature_confidence"));
         // Check it's an observation, not enforcement
-        let dk_hint = hints.iter().find(|h| h["kind"] == "premature_confidence").unwrap();
+        let dk_hint = hints
+            .iter()
+            .find(|h| h["kind"] == "premature_confidence")
+            .unwrap();
         assert_eq!(dk_hint["severity"], "observation");
     }
 
@@ -1479,7 +1610,10 @@ mod tests {
         let result = engine.process(t).unwrap();
         let hints = result["hints"].as_array().unwrap();
         let spawn_hint = hints.iter().find(|h| h["kind"] == "spawn_candidate");
-        assert!(spawn_hint.is_some(), "expected spawn_candidate hint on wide explore");
+        assert!(
+            spawn_hint.is_some(),
+            "expected spawn_candidate hint on wide explore"
+        );
         let meta = &spawn_hint.unwrap()["spawnMeta"];
         assert!(meta.is_object(), "expected spawnMeta object");
         assert_eq!(meta["branchPoints"].as_array().unwrap().len(), 4);
@@ -1507,7 +1641,10 @@ mod tests {
 
         let hints = result["hints"].as_array().unwrap();
         let spawn_hint = hints.iter().find(|h| h["kind"] == "spawn_candidate");
-        assert!(spawn_hint.is_some(), "expected spawn_candidate on uncertain branches");
+        assert!(
+            spawn_hint.is_some(),
+            "expected spawn_candidate on uncertain branches"
+        );
         let meta = &spawn_hint.unwrap()["spawnMeta"];
         let branch_points = meta["branchPoints"].as_array().unwrap();
         assert_eq!(branch_points.len(), 2);
@@ -1536,8 +1673,10 @@ mod tests {
         let result = engine.process(b3).unwrap();
 
         let hints = result["hints"].as_array().unwrap();
-        assert!(hints.iter().any(|h| h["kind"] == "spawn_candidate"),
-            "expected spawn_candidate when branching with 2+ existing branches");
+        assert!(
+            hints.iter().any(|h| h["kind"] == "spawn_candidate"),
+            "expected spawn_candidate when branching with 2+ existing branches"
+        );
     }
 
     #[test]
@@ -1551,8 +1690,10 @@ mod tests {
         let result = engine.process(t).unwrap();
         if let Some(hints) = result.get("hints") {
             let hints = hints.as_array().unwrap();
-            assert!(!hints.iter().any(|h| h["kind"] == "spawn_candidate"),
-                "should NOT get spawn_candidate with only 2 proposals");
+            assert!(
+                !hints.iter().any(|h| h["kind"] == "spawn_candidate"),
+                "should NOT get spawn_candidate with only 2 proposals"
+            );
         }
     }
 
@@ -1566,7 +1707,10 @@ mod tests {
         t.confidence = Some(0.2); // very low -> should recommend "stronger"
         let result = engine.process(t).unwrap();
         let hints = result["hints"].as_array().unwrap();
-        let spawn_hint = hints.iter().find(|h| h["kind"] == "spawn_candidate").unwrap();
+        let spawn_hint = hints
+            .iter()
+            .find(|h| h["kind"] == "spawn_candidate")
+            .unwrap();
         assert_eq!(spawn_hint["spawnMeta"]["recommendedModel"], "stronger");
     }
 
@@ -1582,9 +1726,18 @@ mod tests {
         t.confidence = Some(0.4);
         let result = engine.process(t).unwrap();
         let hints = result["hints"].as_array().unwrap();
-        let spawn_hint = hints.iter().find(|h| h["kind"] == "spawn_candidate").unwrap();
-        let depth = spawn_hint["spawnMeta"]["recommendedDepth"].as_u64().unwrap();
-        assert!(depth >= 3 && depth <= 10, "recommended_depth should be clamped 3-10, got {}", depth);
+        let spawn_hint = hints
+            .iter()
+            .find(|h| h["kind"] == "spawn_candidate")
+            .unwrap();
+        let depth = spawn_hint["spawnMeta"]["recommendedDepth"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            (3..=10).contains(&depth),
+            "recommended_depth should be clamped 3-10, got {}",
+            depth
+        );
     }
 
     // ---- enhanced merge tests (branch outcomes + convergence) ----
@@ -1752,8 +1905,10 @@ mod tests {
         let outcomes = result["mergeSummary"]["branchOutcomes"].as_array().unwrap();
         for outcome in outcomes {
             // doneReason should be null (skipped in serialization) or not present
-            assert!(outcome.get("doneReason").is_none() || outcome["doneReason"].is_null(),
-                "doneReason should be absent when not set");
+            assert!(
+                outcome.get("doneReason").is_none() || outcome["doneReason"].is_null(),
+                "doneReason should be absent when not set"
+            );
         }
     }
 }

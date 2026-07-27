@@ -1,6 +1,6 @@
 [package]
 name = "kp-stepwise"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 description = "Stepwise planning MCP server with branching, exploration, and spawn hints"
 license = "MIT"

@@ -3,15 +3,24 @@ CONTRIBUTING — kp-stepwise
 
 Build & Test
 ------------
-  cargo test                    # 128 tests (105 unit + 23 integration)
+  cargo test                    # unit + MCP wire integration tests
   cargo build --release         # binary: target/release/kp-stepwise
 
 Architecture
 ------------
-  server.rs    MCP handler, param struct, client detection
+  server.rs    MCP handler, room/channel engine registry, resources, client detection
   planner.rs   PlanEngine: validate → track → log → hints → respond
   profiles.rs  Per-model tuning profiles (regex match on model ID)
-  logging.rs   Append-only JSONL persistence
+  logging.rs   Room/channel-scoped append-only JSONL persistence
+
+State Isolation Contract
+------------------------
+  - `channelId` is required on every tool call.
+  - `roomId` defaults to the MCP host session.
+  - PlanEngine state is keyed by `(roomId, channelId)`.
+  - `stepNumber`, branches, confidence counters, and hints are channel-local.
+  - `branchId` never substitutes for a channel ID.
+  - Parallel agents must be assigned unique channel IDs.
 
 Naming note (v0.3.0 rename)
 ---------------------------
@@ -94,13 +103,13 @@ Phase 4 — Per-step adaptive hints
 
 Contributing Guidelines
 -----------------------
-  - Run `cargo test` before pushing. All 128 must pass.
+  - Run `cargo test` before pushing. All tests must pass.
   - No prose in guidance — decision trees and field names only.
   - Token cost of guidance changes must be justified.
   - Profile changes need a matching test.
-  - JSONL format is a contract — the Python learning pipeline reads it.
+  - JSONL format and room/channel routing are contracts — the Python learning pipeline reads them.
     Adding fields is fine. Renaming/removing fields breaks the pipeline.
-    (v0.3.0 renamed thought*→step* keys and the log dir to var/stepwise_logs;
-    external scavengers must be updated to match.)
+    (v0.5.0 routes logs under var/stepwise_logs/{roomId}/channels/{channelId}.jsonl;
+    external scavengers must recurse and join on roomId + channelId.)
   - The binary ships in the kinderpowers plugin. After `cargo build --release`,
     copy to: mcp-servers/bin/linux-x86_64/kp-stepwise
