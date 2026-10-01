@@ -1,0 +1,12 @@
+#!/bin/sh
+# Platform-detecting wrapper for kp-stepwise.
+# Lets one command path serve every supported platform, so a Claude Code plugin
+# manifest (or marketplace entry) can point at this file instead of a
+# platform-specific binary.
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)   exec "$BIN_DIR/linux-x86_64/kp-stepwise" "$@" ;;
+    Darwin-arm64)   exec "$BIN_DIR/macos-arm64/kp-stepwise" "$@" ;;
+    Darwin-x86_64)  echo "macOS Intel not supported. Build from source or use Rosetta." >&2; exit 1 ;;
+    *) echo "Unsupported platform: $(uname -s)-$(uname -m). Build from source: cargo build --release" >&2; exit 1 ;;
+esac
